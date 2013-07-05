@@ -16,7 +16,8 @@
      bep9/0, bep9/1,
      partial_downloading/0, partial_downloading/1,
      checking/0, checking/1,
-     find_local_peers/0, find_local_peers/1
+     find_local_peers/0, find_local_peers/1,
+     bad_peer/0, bad_peer/1
      ]).
 
 
@@ -72,13 +73,14 @@ init_per_suite(Config) ->
     {ok, TorrentIH}    = etorrent_dotdir:info_hash(HTTPTorrentFn),
     {ok, DirTorrentIH} = etorrent_dotdir:info_hash(DirTorrentFn),
     %% Start slave nodes.
-    {ok, SeedNode}       = test_server:start_node(seeder, slave, []),
-    {ok, LeechNode}      = test_server:start_node(leecher, slave, []),
-    {ok, MiddlemanNode}  = test_server:start_node(middleman, slave, []),
-    {ok, ChokedSeedNode} = test_server:start_node(choked_seeder, slave, []),
+    {ok, SNode} = test_server:start_node(seeder, slave, []),
+    {ok, LNode} = test_server:start_node(leecher, slave, []),
+    {ok, BNode} = test_server:start_node(bad_seeder, slave, []),
+    {ok, MNode} = test_server:start_node(middleman, slave, []),
+    {ok, CNode} = test_server:start_node(choked_seeder, slave, []),
     %% Run logger on the slave nodes
     [prepare_node(Node)
-     || Node <- [SeedNode, LeechNode, MiddlemanNode, ChokedSeedNode]],
+     || Node <- [SNode, LNode, MNode, CNode, BNode]],
     [{trackerless_torrent_file, DumpTorrentFn},
      {http_torrent_file, HTTPTorrentFn},
      {udp_torrent_file, UDPTorrentFn},
@@ -100,20 +102,23 @@ init_per_suite(Config) ->
      {info_hash_bin, hex_to_bin_hash(TorrentIH)},
      {dir_info_hash_bin, hex_to_bin_hash(DirTorrentIH)},
 
-     {leech_node, LeechNode},
-     {middleman_node, MiddlemanNode},
-     {choked_seed_node, ChokedSeedNode},
-     {seed_node, SeedNode} | Config].
+     {leech_node, LNode},
+     {bad_seed_node, BNode},
+     {middleman_node, MNode},
+     {choked_seed_node, CNode},
+     {seed_node, SNode} | Config].
 
 
 
 end_per_suite(Config) ->
     LN = ?config(leech_node, Config),
     SN = ?config(seed_node, Config),
+    BN = ?config(bad_seed_node, Config),
     MN = ?config(middleman_node, Config),
     CN = ?config(choked_seed_node, Config),
     test_server:stop_node(SN),
     test_server:stop_node(LN),
+    test_server:stop_node(BN),
     test_server:stop_node(MN),
     test_server:stop_node(CN),
     ok.
@@ -242,6 +247,45 @@ init_per_testcase(checking, Config) ->
      {src_filename, SrcFn},
      {dest_filename, DestFn},
      {seed_node_dir, SNodeDir},
+     {leech_node_dir, LNodeDir} | Config];
+init_per_testcase(bad_peer, Config) ->
+    %% etorrent => etorrent
+    PrivDir   = ?config(priv_dir, Config),
+    DataDir   = ?config(data_dir, Config),
+    TorrentFn = ?config(http_torrent_file, Config),
+    SNode     = ?config(seed_node, Config),
+    LNode     = ?config(leech_node, Config),
+    BNode     = ?config(bad_seed_node, Config),
+    Fn        = ?config(data_filename, Config),
+    BrokenFn  = ?config(broken_data_filename, Config),
+    TrackerPid = start_opentracker(DataDir),
+    SNodeDir = filename:join([PrivDir,  seed]),
+    LNodeDir = filename:join([PrivDir,  leech]),
+    BNodeDir = filename:join([PrivDir,  bad_seed]),
+    BaseFn   = filename:basename(Fn),
+    SrcFn    = filename:join([SNodeDir, "downloads", BaseFn]),
+    DestFn   = filename:join([LNodeDir, "downloads", BaseFn]),
+    BadSrcFn = filename:join([BNodeDir, "downloads", BaseFn]),
+    create_standard_directory_layout(SNodeDir),
+    create_standard_directory_layout(LNodeDir),
+    create_standard_directory_layout(BNodeDir),
+    SNodeConf = seed_configuration(SNodeDir),
+    LNodeConf = leech_configuration(LNodeDir),
+    BNodeConf = bad_seed_configuration(BNodeDir),
+    %% Feed etorrent the file to work with
+    {ok, _} = file:copy(Fn, SrcFn),
+    {ok, _} = file:copy(BrokenFn, BadSrcFn),
+    [error(files_are_equal) || compare_file_contents(SrcFn, BadSrcFn)],
+    %% Copy torrent-file to torrents-directory
+    {ok, _} = copy_to(TorrentFn, ?config(dir, SNodeConf)),
+    start_app(SNode, SNodeConf),
+    start_app(LNode, LNodeConf),
+    start_app(BNode, BNodeConf),
+    [{tracker_port, TrackerPid},
+     {src_filename, SrcFn},
+     {dest_filename, DestFn},
+     {seed_node_dir, SNodeDir},
+     {bad_seed_node_dir, BNodeDir},
      {leech_node_dir, LNodeDir} | Config];
 init_per_testcase(udp_seed_leech, Config) ->
     %% etorrent => etorrent
@@ -487,6 +531,21 @@ end_per_testcase(checking, Config) ->
     clean_standard_directory_layout(LNodeDir),
     stop_opentracker(?config(tracker_port, Config)),
     ok;
+end_per_testcase(bad_peer, Config) ->
+    SNode       = ?config(seed_node, Config),
+    LNode       = ?config(leech_node, Config),
+    BNode       = ?config(bad_seed_node, Config),
+    SNodeDir    = ?config(seed_node_dir, Config),
+    LNodeDir    = ?config(leech_node_dir, Config),
+    BNodeDir    = ?config(bad_seed_node_dir, Config),
+    stop_app(SNode),
+    stop_app(LNode),
+    stop_app(BNode),
+    clean_standard_directory_layout(SNodeDir),
+    clean_standard_directory_layout(LNodeDir),
+    clean_standard_directory_layout(BNodeDir),
+    stop_opentracker(?config(tracker_port, Config)),
+    ok;
 end_per_testcase(udp_seed_leech, Config) ->
     SNode       = ?config(seed_node, Config),
     LNode       = ?config(leech_node, Config),
@@ -627,11 +686,19 @@ choked_seed_configuration(Dir) ->
      {max_upload_rate, 1000}
     | standard_directory_layout(Dir, ct:get_config(common_conf))].
 
+bad_seed_configuration(Dir) ->
+    [{listen_ip, {127,0,0,3}},
+     {port, 1781 },
+     {udp_port, 1782 },
+     {dht_port, 1783 },
+     {max_download_rate, 1000}
+    | standard_directory_layout(Dir, ct:get_config(common_conf))].
+
 
 %% Tests
 %% ----------------------------------------------------------------------
 groups() ->
-    Tests = [find_local_peers,
+    Tests = [bad_peer, find_local_peers,
              seed_transmission, leech_transmission, seed_leech,
              partial_downloading, udp_seed_leech, bep9,
              down_udp_tracker, checking, choked_reject],
@@ -804,6 +871,27 @@ checking(Config) ->
 	=:= sha1_file(?config(dest_filename, Config)).
 
 
+bad_peer() ->
+    [{require, common_conf, etorrent_common_config}].
+
+bad_peer(Config) ->
+    io:format("~n======START TEST CASE WITH A BAD PEER======~n", []),
+    {Ref, Pid} = {make_ref(), self()},
+    {ok, _} = rpc:call(?config(bad_seed_node, Config),
+		  etorrent_ctl, start,
+		  [?config(http_torrent_file, Config), [no_check, completed]]),
+    {ok, _} = rpc:call(?config(leech_node, Config),
+		  etorrent, start,
+		  [?config(http_torrent_file, Config), {Ref, Pid}]),
+    receive
+	{Ref, done} -> ok
+    after
+	120*1000 -> exit(timeout_error)
+    end,
+    sha1_file(?config(src_filename, Config))
+	=:= sha1_file(?config(dest_filename, Config)).
+
+
 bep9() ->
     [{require, common_conf, etorrent_common_config}].
 
@@ -867,7 +955,6 @@ find_local_peers(Config) ->
     error_logger:info_msg("Infohash is ~p.", [HexIH]),
 
     LeechNode     = ?config(leech_node, Config),
-    SeedNode      = ?config(seed_node, Config),
 
     Self = self(),
     Ref = make_ref(),
